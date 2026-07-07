@@ -28,7 +28,7 @@ func NewOptimizedClient() *http.Client {
 		Transport: &http.Transport{
 			// Максимальное количество открытых соединений в общем пуле
 			MaxIdleConns:        1000, 
-			// Максимальное количество соединений на один хост
+			// Максимальное количество соединений на один хост (критично для скорости)
 			MaxIdleConnsPerHost: 100,
 			// Время ожидания TCP-соединения
 			IdleConnTimeout:     90 * time.Second,
@@ -37,7 +37,7 @@ func NewOptimizedClient() *http.Client {
 				Timeout:   5 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
-			// Отключаем проверку TLS для некоторых ресурсов
+			// Отключаем проверку TLS для некоторых ресурсов (опционально, для скорости)
 			TLSHandshakeTimeout: 5 * time.Second,
 		},
 	}
