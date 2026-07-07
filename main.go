@@ -33,7 +33,7 @@ type Site struct {
 type Result struct {
 	SiteName   string        `json:"site_name"`
 	Target     string        `json:"target"`
-	URL        `json:"url"`
+	URL 	   string 		 `json:"url"`
 	Found      bool          `json:"found"`
 	Confidence int           `json:"confidence"`
 	Duration   time.Duration `json:"duration"`
@@ -290,7 +290,7 @@ func main() {
 	w := flag.Int("w", 100, "Number of workers")
 	s := flag.String("s", "sites.json", "Sites database JSON")
 	p := flag.String("p", "", "Proxies file")
-	o := flag.String("o", "results.json", "Output file")
+	_ = flag.String("o", "results.json", "Output file")
 	flag.Parse()
 
 	if *u == "" && *f == "" {
