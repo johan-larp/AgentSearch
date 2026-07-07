@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +39,6 @@ func (e *Engine) Run(ctx context.Context, progress chan<- models.Result) {
 	results := make(chan models.Result, len(e.Sites))
 	var wg sync.WaitGroup
 
-	// Worker Pool
 	for i := 0; i < e.Workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -47,7 +49,6 @@ func (e *Engine) Run(ctx context.Context, progress chan<- models.Result) {
 		}()
 	}
 
-	// Feed jobs
 	go func() {
 		for _, s := range e.Sites {
 			jobs <- s
@@ -55,7 +56,6 @@ func (e *Engine) Run(ctx context.Context, progress chan<- models.Result) {
 		close(jobs)
 	}()
 
-	// Result Collector
 	go func() {
 		for res := range results {
 			e.Streamer.Write(res)
@@ -70,6 +70,7 @@ func (e *Engine) Run(ctx context.Context, progress chan<- models.Result) {
 func (e *Engine) checkSite(ctx context.Context, site models.Site) models.Result {
 	start := time.Now()
 	targetURL := strings.ReplaceAll(site.URL, "{target}", e.Target)
+	targetURL = strings.ReplaceAll(targetURL, "{username}", e.Target)
 	res := models.Result{SiteName: site.Name, Target: e.Target, URL: targetURL}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
@@ -90,7 +91,6 @@ func (e *Engine) checkSite(ctx context.Context, site models.Site) models.Result 
 	}
 	defer resp.Body.Close()
 
-	// Read body limited to 64KB to avoid memory overflow
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	body := string(bodyBytes)
 
@@ -104,34 +104,56 @@ func (e *Engine) checkSite(ctx context.Context, site models.Site) models.Result 
 
 func (e *Engine) calculateConfidence(site models.Site, statusCode int, body string) (bool, int) {
 	score := 0
-
-	// 1. HTTP Status Check
 	switch site.ErrorType {
 	case "status_code":
-		if statusCode == site.ErrorCode {
-			return false, 0
-		}
-		if statusCode == 200 {
-			score += 40
-		}
+		if statusCode == site.ErrorCode { return false, 0 }
+		if statusCode == 200 { score += 40 }
 	case "message":
-		if site.ErrorMsg != "" && strings.Contains(body, site.ErrorMsg) {
-			return false, 0
-		}
+		if site.ErrorMsg != "" && strings.Contains(body, site.ErrorMsg) { return false, 0 }
 		score += 40
 	}
-
-	// 2. Content Verification (Target presence)
 	if strings.Contains(strings.ToLower(body), strings.ToLower(e.Target)) {
 		score += 30
 	}
-
-	// 3. Site Weight
 	score += site.Weight
+	if score > 100 { score = 100 }
+	return score >= 50, score
+}
 
-	if score > 100 {
-		score = 100
+func SmartLoadSites(path string) ([]models.Site, error) {
+	data, err := os.ReadFile(path)
+	if err != nil { return nil, err }
+
+	var sites []models.Site
+	if err := json.Unmarshal(data, &sites); err == nil {
+		return sites, nil
 	}
 
-	return score >= 50, score
+	var wrap struct {
+		Sites map[string]struct {
+			URL        string            `json:"url"`
+			URLMain    string            `json:"urlMain"`
+			CheckType  string            `json:"checkType"`
+			AbsenceStr []string          `json:"absenceStrs"`
+			Headers    map[string]string `json:"headers"`
+			Disabled   bool              `json:"disabled"`
+		} `json:"sites"`
+	}
+	if err := json.Unmarshal(data, &wrap); err == nil {
+		var converted []models.Site
+		for name, s := range wrap.Sites {
+			if s.Disabled { continue }
+			absence := ""
+			if len(s.AbsenceStr) > 0 { absence = s.AbsenceStr[0] }
+			errorType := "message"
+			if s.CheckType == "status_code" { errorType = "status_code" }
+			converted = append(converted, models.Site{
+				Name: name, URL: s.URL, SearchType: "username",
+				ErrorType: errorType, ErrorCode: 404, ErrorMsg: absence,
+				Weight: 10, Headers: s.Headers,
+			})
+		}
+		return converted, nil
+	}
+	return nil, fmt.Errorf("invalid JSON format")
 }

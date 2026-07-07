@@ -22,8 +22,8 @@ import (
 type Site struct {
 	Name       string            `json:"name"`
 	URL        string            `json:"url"`
-	SearchType string            `json:"search_type"` // "username" or "email"
-	ErrorType  string            `json:"error_type"`  // "status_code", "message"
+	SearchType string            `json:"search_type"`
+	ErrorType  string            `json:"error_type"`
 	ErrorCode  int               `json:"error_code"`
 	ErrorMsg   string            `json:"error_msg"`
 	Weight     int               `json:"weight"`
@@ -33,20 +33,19 @@ type Site struct {
 type Result struct {
 	SiteName   string        `json:"site_name"`
 	Target     string        `json:"target"`
-	URL        string        `json:"url"`
+	URL        `json:"url"`
 	Found      bool          `json:"found"`
 	Confidence int           `json:"confidence"`
 	Duration   time.Duration `json:"duration"`
 	Error      string        `json:"error,omitempty"`
 }
 
-// --- UTILS ---
+// --- NETWORK ---
 
 var UserAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
 }
 
 type ProxyRotator struct {
@@ -55,16 +54,10 @@ type ProxyRotator struct {
 }
 
 func NewProxyRotator(filePath string) *ProxyRotator {
-	if filePath == "" {
-		return nil
-	}
+	if filePath == "" { return nil }
 	file, err := os.Open(filePath)
-	if err != nil {
-		fmt.Printf("⚠️ Proxy file error: %v\n", err)
-		return nil
-	}
+	if err != nil { return nil }
 	defer file.Close()
-
 	var proxies []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -76,11 +69,31 @@ func NewProxyRotator(filePath string) *ProxyRotator {
 }
 
 func (pr *ProxyRotator) GetNext() string {
-	if pr == nil || len(pr.proxies) == 0 {
-		return ""
-	}
+	if pr == nil || len(pr.proxies) == 0 { return "" }
 	idx := atomic.AddUint64(&pr.index, 1)
 	return pr.proxies[idx%uint64(len(pr.proxies))]
+}
+
+type RotatorTransport struct {
+	Rotator *ProxyRotator
+}
+
+func (t *RotatorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.Rotator == nil {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+	proxyAddr := t.Rotator.GetNext()
+	proxyURL, err := url.Parse(proxyAddr)
+	if err != nil {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+	tempTransport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		DialContext: (&net.Dialer{
+			Timeout: 5 * time.Second,
+		}).DialContext,
+	}
+	return tempTransport.RoundTrip(req)
 }
 
 // --- ENGINE ---
@@ -88,7 +101,6 @@ func (pr *ProxyRotator) GetNext() string {
 type Engine struct {
 	Client     *http.Client
 	Sites      []Site
-	ProxyRot   *ProxyRotator
 	Target     string
 	Workers    int
 	OutputFile string
@@ -96,31 +108,12 @@ type Engine struct {
 
 func NewEngine(sites []Site, target string, workers int, proxyFile string, outputFile string) *Engine {
 	pr := NewProxyRotator(proxyFile)
-
-	// HIGH PERFORMANCE TRANSPORT
-	transport := &http.Transport{
-		Proxy: func(url *url.URL) (*url.URL, error) {
-			if pr == nil {
-				return nil, nil
-			}
-			pAddr := pr.GetNext()
-			return url.Parse(pAddr)
-		},
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          2000,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
 	return &Engine{
-		Client:     &http.Client{Transport: transport, Timeout: 10 * time.Second},
+		Client: &http.Client{
+			Timeout: 15 * time.Second,
+			Transport: &RotatorTransport{Rotator: pr},
+		},
 		Sites:      sites,
-		ProxyRot:   pr,
 		Target:     target,
 		Workers:    workers,
 		OutputFile: outputFile,
@@ -132,12 +125,10 @@ func (e *Engine) Run(ctx context.Context, progress chan<- Result) {
 	results := make(chan Result, len(e.Sites))
 	var wg sync.WaitGroup
 
-	// Output file for streaming
 	outFile, _ := os.Create(e.OutputFile)
 	defer outFile.Close()
 	outFile.WriteString("[\n")
 
-	// Workers
 	for i := 0; i < e.Workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -148,7 +139,6 @@ func (e *Engine) Run(ctx context.Context, progress chan<- Result) {
 		}()
 	}
 
-	// Feed jobs
 	go func() {
 		for _, s := range e.Sites {
 			jobs <- s
@@ -156,7 +146,6 @@ func (e *Engine) Run(ctx context.Context, progress chan<- Result) {
 		close(jobs)
 	}()
 
-	// Collector
 	go func() {
 		first := true
 		for res := range results {
@@ -178,6 +167,7 @@ func (e *Engine) Run(ctx context.Context, progress chan<- Result) {
 func (e *Engine) checkSite(ctx context.Context, site Site) Result {
 	start := time.Now()
 	targetURL := strings.ReplaceAll(site.URL, "{target}", e.Target)
+	targetURL = strings.ReplaceAll(targetURL, "{username}", e.Target)
 	res := Result{SiteName: site.Name, Target: e.Target, URL: targetURL}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
@@ -236,17 +226,71 @@ func (e *Engine) score(site Site, statusCode int, body string) (bool, int) {
 	return confidence >= 50, confidence
 }
 
+// --- SMART JSON LOADER ---
+
+func loadSites(path string) ([]Site, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Try parsing as direct array
+	var sites []Site
+	if err := json.Unmarshal(data, &sites); err == nil {
+		return sites, nil
+	}
+
+	// Try parsing as object { "sites": { "Name": { ... } } }
+	var wrap struct {
+		Sites map[string]struct {
+			URL        string            `json:"url"`
+			URLMain    string            `json:"urlMain"`
+			CheckType  string            `json:"checkType"`
+			AbsenceStr []string          `json:"absenceStrs"`
+			Headers    map[string]string `json:"headers"`
+			Disabled   bool              `json:"disabled"`
+		} `json:"sites"`
+	}
+	if err := json.Unmarshal(data, &wrap); err == nil {
+		var converted []Site
+		for name, s := range wrap.Sites {
+			if s.Disabled {
+				continue
+			}
+			absence := ""
+			if len(s.AbsenceStr) > 0 {
+				absence = s.AbsenceStr[0]
+			}
+			errorType := "message"
+			if s.CheckType == "status_code" {
+				errorType = "status_code"
+			}
+			converted = append(converted, Site{
+				Name:       name,
+				URL:        s.URL,
+				SearchType: "username",
+				ErrorType:  errorType,
+				ErrorCode:  404,
+				ErrorMsg:   absence,
+				Weight:     10,
+				Headers:    s.Headers,
+			})
+		}
+		return converted, nil
+	}
+
+	return nil, fmt.Errorf("invalid JSON format")
+}
+
 // --- MAIN ---
 
 func main() {
-	u := flag.String("u", "", "Username or Email to search")
+	u := flag.String("u", "", "Target username or email")
 	f := flag.String("f", "", "File with targets")
 	w := flag.Int("w", 100, "Number of workers")
 	s := flag.String("s", "sites.json", "Sites database JSON")
 	p := flag.String("p", "", "Proxies file")
 	o := flag.String("o", "results.json", "Output file")
-	d := flag.Bool("deep", false, "Enable Deep Search")
-
 	flag.Parse()
 
 	if *u == "" && *f == "" {
@@ -254,14 +298,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load DB
-	data, err := os.ReadFile(*s)
+	sites, err := loadSites(*s)
 	if err != nil {
 		fmt.Printf("❌ DB Error: %v\n", err)
 		os.Exit(1)
 	}
-	var sites []Site
-	json.Unmarshal(data, &sites)
 
 	targets := []string{}
 	if *u != "" {
@@ -270,19 +311,14 @@ func main() {
 	if *f != "" {
 		fileData, _ := os.ReadFile(*f)
 		for _, line := range strings.Split(string(fileData), "\n") {
-			if line != "" {
-				targets = append(targets, strings.TrimSpace(line))
+			if line := strings.TrimSpace(line); line != "" {
+				targets = append(targets, line)
 			}
 		}
 	}
 
 	for _, target := range targets {
-		fmt.Printf("\n\033[1;34m🔍 Target: %s\033[0m\n", target)
-		
-		if *d {
-			fmt.Println("🌐 Deep Search Dorks generated (check logs)...")
-		}
-
+		fmt.Printf("\n\033[1;34m🔍 Searching for: %s\033[0m\n", target)
 		eng := NewEngine(sites, target, *w, *p, fmt.Sprintf("res_%s.json", target))
 		progress := make(chan Result)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -298,5 +334,5 @@ func main() {
 		eng.Run(ctx, progress)
 		cancel()
 	}
-	fmt.Println("\n✅ All targets processed. Results saved to JSON.")
+	fmt.Println("\n✅ All targets processed.")
 }

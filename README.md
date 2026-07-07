@@ -20,7 +20,7 @@ By leveraging an optimized network stack and concurrency, AgentSearch can check 
 
 ### Build
 ```bash
-git clone https://github.com/johan-larp/AgentSearch.git
+git clone https://github.com/yourusername/AgentSearch.git
 cd AgentSearch
 go build -o agentsearch main.go
 ```
@@ -29,17 +29,17 @@ go build -o agentsearch main.go
 
 ### Basic search by username
 ```bash
-./agentsearch -u target_user
+./agentsearch search -u target_user
 ```
 
 ### Search using a file list, proxies, and high concurrency
 ```bash
-./agentsearch -f users.txt -p proxies.txt -w 500 -o results.json
+./agentsearch search -f users.txt -p proxies.txt -w 500 -o results.json
 ```
 
 ### Deep Search mode (Dorking)
 ```bash
-./agentsearch -u target_user -deep
+./agentsearch search -u target_user --deep
 ```
 
 ### Available Flags
@@ -51,7 +51,7 @@ go build -o agentsearch main.go
 | `-p, --proxies` | Path to proxies file (`ip:port`) | `""` |
 | `-s, --sites` | Path to sites database JSON | `sites.json` |
 | `-o, --output` | Output JSON file | `results.json` |
-| `-deep` | Enable Deep Search (Dorks) | `false` |
+| `-d, --deep` | Enable Deep Search (Dorks) | `false` |
 
 ## 📂 Database Structure (`sites.json`)
 
