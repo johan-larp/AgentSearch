@@ -20,7 +20,7 @@ By leveraging an optimized network stack and concurrency, AgentSearch can check 
 
 ### Build
 ```bash
-git clone https://github.com/yourusername/AgentSearch.git
+git clone https://github.com/johan-larp/AgentSearch.git
 cd AgentSearch
 go build -o agentsearch main.go
 ```
