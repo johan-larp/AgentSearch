@@ -2,90 +2,49 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"flag"
-	"fmt"
+	"log/slog"
 	"os"
-	"strings"
 
-	"github.com/user/agentsearch/internal/engine"
-	"github.com/user/agentsearch/internal/models"
-	"github.com/user/agentsearch/internal/network"
-	"github.com/user/agentsearch/internal/storage"
+	"github.com/johan-larp/agentsearch/internal/app"
+	"github.com/johan-larp/agentsearch/internal/config"
 )
 
 func main() {
-	u := flag.String("u", "", "Target username or email")
-	f := flag.String("f", "", "File with targets")
-	w := flag.Int("w", 100, "Number of workers")
-	s := flag.String("s", "sites.json", "Sites database JSON")
-	p := flag.String("p", "", "Proxies file")
-	o := flag.String("o", "results.json", "Output file")
-	flag.Parse()
+	// Структурированное логирование через стандартный пакет log/slog (Go 1.21+)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
 
-	if *u == "" && *f == "" {
-		fmt.Println("❌ Usage: agentsearch -u target OR -f targets.txt")
-		os.Exit(1)
-	}
-
-	// 1. Load DB
-	data, err := os.ReadFile(*s)
+	cfg, err := config.ParseFlags()
 	if err != nil {
-		fmt.Printf("❌ DB Error: %v\n", err)
-		os.Exit(1)
-	}
-	var sites []models.Site
-	if err := json.Unmarshal(data, &sites); err != nil {
-		fmt.Printf("❌ JSON Parse Error: %v\n", err)
+		slog.Error("configuration error", "error", err)
 		os.Exit(1)
 	}
 
-	// 2. Prepare Targets
-	targets := []string{}
-	if *u != "" {
-		targets = append(targets, *u)
-	}
-	if *f != "" {
-		fileData, _ := os.ReadFile(*f)
-		for _, line := range strings.Split(string(fileData), "\n") {
-			if line := strings.TrimSpace(line); line != "" {
-				targets = append(targets, line)
-			}
-		}
-	}
+	slog.Info("agentsearch starting",
+		"targets", len(cfg.Targets),
+		"workers", cfg.Workers,
+		"sites", cfg.SitesFile,
+		"proxies", cfg.ProxiesFile,
+		"output", cfg.OutputDir,
+		"formats", cfg.OutputFormats,
+	)
 
-	// 3. Network setup
-	client, err := network.NewOptimizedClient(*p)
+	// Контекст с жестким таймаутом на весь процесс
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.TotalTimeout)
+	defer cancel()
+
+	application, err := app.New(cfg)
 	if err != nil {
-		fmt.Printf("❌ Network Error: %v\n", err)
+		slog.Error("initialization error", "error", err)
 		os.Exit(1)
 	}
 
-	// 4. Execution
-	for _, target := range targets {
-		fmt.Printf("\n\033[1;34m🔍 Searching for: %s\033[0m\n", target)
-
-		streamer, err := storage.NewJSONStreamer(fmt.Sprintf("res_%s.json", target))
-		if err != nil {
-			fmt.Printf("❌ Storage Error: %v\n", err)
-			continue
-		}
-
-		eng := engine.NewEngine(sites, target, *w, streamer, client)
-		progress := make(chan models.Result)
-		ctx, cancel := context.WithCancel(context.Background())
-
-		go func() {
-			for res := range progress {
-				if res.Found {
-					fmt.Printf(" \033[1;32m[+]\033[0m %-20s | %d%% | %s\n", res.SiteName, res.Confidence, res.URL)
-				}
-			}
-		}()
-
-		eng.Run(ctx, progress)
-		cancel()
-		streamer.Close()
+	if err := application.Run(ctx); err != nil {
+		slog.Error("runtime error", "error", err)
+		os.Exit(1)
 	}
-	fmt.Println("\n✅ All tasks completed.")
+
+	slog.Info("agentsearch finished successfully")
 }

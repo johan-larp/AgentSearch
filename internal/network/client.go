@@ -1,87 +1,112 @@
 package network
 
 import (
-	"bufio"
-	"fmt"
+	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
-type ProxyRotator struct {
-	proxies []string
-	index   uint64
+// ClientConfig содержит тюнинговые параметры HTTP-клиента.
+type ClientConfig struct {
+	RequestTimeout      time.Duration
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
 }
 
-func NewProxyRotator(filePath string) (*ProxyRotator, error) {
-	if filePath == "" { return nil, nil }
-	file, err := os.Open(filePath)
-	if err != nil { return nil, err }
-	defer file.Close()
+// NewOptimizedClient создает http.Client с настроенным Transport.
+// Если прокси не используются — возвращает единый Transport с агрессивным пулом соединений.
+// Если прокси используются — оборачивает в кастомный RoundTripper, который клонирует Transport
+// под каждый запрос, избегая data race при смене Proxy/DialContext.
+func NewOptimizedClient(cfg ClientConfig, ua *UARotator, pr *ProxyRotator) *http.Client {
+	baseTransport := &http.Transport{
+		MaxIdleConns:          cfg.MaxIdleConns,
+		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       cfg.MaxIdleConnsPerHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: cfg.RequestTimeout / 2,
+		ExpectContinueTimeout: 1 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: false,
+			MinVersion:         tls.VersionTLS12,
+		},
+		ForceAttemptHTTP2: true,
+	}
 
-	var proxies []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if line := scanner.Text(); line != "" {
-			proxies = append(proxies, line)
+	// Без прокси — один Transport на все запросы, пул работает на полную.
+	if !pr.HasProxies() {
+		return &http.Client{
+			Timeout:   cfg.RequestTimeout,
+			Transport: baseTransport,
 		}
 	}
-	return &ProxyRotator{proxies: proxies}, nil
-}
 
-func (pr *ProxyRotator) GetNext() string {
-	if pr == nil || len(pr.proxies) == 0 { return "" }
-	idx := atomic.AddUint64(&pr.index, 1)
-	return pr.proxies[idx%uint64(len(pr.proxies))]
-}
-
-type RotatorTransport struct {
-	Rotator *ProxyRotator
-	Base    *http.Transport
-}
-
-func (t *RotatorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.Rotator == nil {
-		return t.Base.RoundTrip(req)
+	// С прокси — клонируем Transport под каждый запрос, чтобы избежать гонок
+	// при смене DialContext/Proxy. Клонирование копирует только настройки, не сокеты.
+	return &http.Client{
+		Timeout: cfg.RequestTimeout,
+		Transport: &proxyRotatorTransport{
+			base:    baseTransport,
+			rotator: pr,
+			ua:      ua,
+		},
 	}
-	proxyAddr := t.Rotator.GetNext()
+}
+
+// proxyRotatorTransport реализует http.RoundTripper с динамической ротацией прокси.
+type proxyRotatorTransport struct {
+	base    *http.Transport
+	rotator *ProxyRotator
+	ua      *UARotator
+}
+
+func (t *proxyRotatorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Ротация User-Agent на уровне Transport
+	if t.ua != nil {
+		req.Header.Set("User-Agent", t.ua.GetRandom())
+	}
+
+	proxyAddr := t.rotator.GetNext()
+	if proxyAddr == "" {
+		return t.base.RoundTrip(req)
+	}
+
 	proxyURL, err := url.Parse(proxyAddr)
 	if err != nil {
-		return t.Base.RoundTrip(req)
+		return t.base.RoundTrip(req)
 	}
-	tempTransport := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-		DialContext: (&net.Dialer{
-			Timeout: 5 * time.Second,
-		}).DialContext,
+
+	// Клонируем базовый Transport для изоляции настроек прокси этого конкретного запроса.
+	tr := t.base.Clone()
+
+	switch proxyURL.Scheme {
+	case "http", "https":
+		tr.Proxy = http.ProxyURL(proxyURL)
+	case "socks5", "socks5h":
+		// golang.org/x/net/proxy: поддерживаем как ContextDialer, так и legacy Dialer
+		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		if err == nil {
+			if cd, ok := dialer.(proxy.ContextDialer); ok {
+				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return cd.DialContext(ctx, network, addr)
+				}
+			} else {
+				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.Dial(network, addr)
+				}
+			}
+			tr.Proxy = nil // отключаем HTTP-прокси
+		}
 	}
-	return tempTransport.RoundTrip(req)
-}
 
-func NewOptimizedClient(proxyFile string) (*http.Client, error) {
-	rotator, err := NewProxyRotator(proxyFile)
-	if err != nil { return nil, err }
-
-	return &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &RotatorTransport{
-			Rotator: rotator,
-			Base: &http.Transport{
-				MaxIdleConns: 2000,
-				MaxIdleConnsPerHost: 100,
-			},
-		},
-	}, nil
-}
-
-func GetRandomUA() string {
-	uas := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-	}
-	return uas[time.Now().UnixNano()%int64(len(uas))]
+	return tr.RoundTrip(req)
 }
