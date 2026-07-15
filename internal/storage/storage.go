@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/user/agentsearch/internal/models"
+	"github.com/johan-larp/agentsearch/internal/models"
 )
 
 type JSONStreamer struct {
