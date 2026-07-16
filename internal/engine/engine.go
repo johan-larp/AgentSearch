@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/agentsearch/internal/models"
-	"github.com/user/agentsearch/internal/network"
-	"github.com/user/agentsearch/internal/storage"
+	"github.com/johan-larp/agentsearch/internal/models"
+	"github.com/johan-larp/agentsearch/internal/network"
+	"github.com/johan-larp/agentsearch/internal/storage"
 )
 
 type Engine struct {
