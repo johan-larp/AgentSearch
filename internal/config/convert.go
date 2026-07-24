@@ -1,104 +1,293 @@
 package config
 
 import (
-	"flag"
+	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
-	"time"
+
+	"github.com/johan-larp/agentsearch/internal/models"
+	"gopkg.in/yaml.v3"
 )
 
-// AppConfig агрегирует все CLI-флаги и runtime-настройки.
-type AppConfig struct {
-	Targets             []string
-	SitesFile           string
-	ProxiesFile         string
-	OutputDir           string
-	OutputFormats       []string
-	ReportFormats       []string
-	Workers             int
-	RequestTimeout      time.Duration
-	TotalTimeout        time.Duration
-	MaxIdleConns        int
-	MaxIdleConnsPerHost int
-	RateLimitPerHost    time.Duration
-	UserAgentFile       string
-	DeepSearch          bool
-	UseUTLS             bool
-	MaxRetries          int
+// MergeAndConvert объединяет несколько JSON-файлов (Sherlock / Maigret) в единый YAML.
+func MergeAndConvert(output string, inputs ...string) error {
+	merged := make(map[string]models.SiteConfig)
+
+	for _, path := range inputs {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+
+		// Определяем формат по наличию обёртки "sites"
+		var wrapper struct {
+			Sites json.RawMessage `json:"sites"`
+		}
+		if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.Sites) > 0 {
+			// Maigret-формат
+			sites, err := parseMaigret(wrapper.Sites)
+			if err != nil {
+				return fmt.Errorf("parse maigret %s: %w", path, err)
+			}
+			mergeInto(merged, sites)
+			continue
+		}
+
+		// Sherlock-формат (плоский объект)
+		sites, err := parseSherlock(data)
+		if err != nil {
+			return fmt.Errorf("parse sherlock %s: %w", path, err)
+		}
+		mergeInto(merged, sites)
+	}
+
+	// Преобразуем map в отсортированный слайс, отбрасывая записи без URL
+	var list []models.SiteConfig
+	for _, s := range merged {
+		if strings.TrimSpace(s.URL) == "" {
+			continue // пропускаем engine-only сайты без прямого URL
+		}
+		list = append(list, s)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return strings.ToLower(list[i].Name) < strings.ToLower(list[j].Name)
+	})
+
+	out, err := yaml.Marshal(list)
+	if err != nil {
+		return fmt.Errorf("marshal yaml: %w", err)
+	}
+
+	if err := os.WriteFile(output, out, 0o644); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+	return nil
 }
 
-// ParseFlags разбирает аргументы командной строки.
-func ParseFlags() (*AppConfig, error) {
-	var (
-		u   = flag.String("u", "", "Target username or email")
-		f   = flag.String("f", "", "File with targets (one per line)")
-		s   = flag.String("s", "configs/sites.yaml", "Sites database YAML/JSON")
-		p   = flag.String("p", "", "Proxies file (http://ip:port or socks5://ip:port)")
-		o   = flag.String("o", "output", "Output directory")
-		of  = flag.String("of", "json,csv,txt", "Output formats: json,csv,txt (comma-separated)")
-		rf  = flag.String("rf", "cli,html", "Report formats: cli,html,docx (comma-separated)")
-		w   = flag.Int("w", 50, "Number of concurrent workers")
-		rt  = flag.Duration("rt", 15*time.Second, "HTTP request timeout")
-		tt  = flag.Duration("tt", 10*time.Minute, "Total search timeout per batch")
-		mc  = flag.Int("mc", 500, "Max idle connections in pool")
-		mch = flag.Int("mch", 100, "Max idle connections per host")
-		rl  = flag.Duration("rl", 500*time.Millisecond, "Rate limit delay between requests to same host")
-		ua  = flag.String("ua", "", "External User-Agent list file")
-		d   = flag.Bool("d", false, "Enable deep search (dorking mode stub)")
-		utls= flag.Bool("utls", false, "Enable uTLS JA3 fingerprint spoofing (anti-WAF)")
-		retries = flag.Int("retries", 2, "Max retries on 429/5xx errors")
-	)
-	flag.Parse()
-
-	if *u == "" && *f == "" {
-		return nil, fmt.Errorf("usage: ./agentsearch -u target OR -f targets.txt")
+// parseSherlock парсит плоский JSON Sherlock.
+func parseSherlock(data []byte) (map[string]models.SiteConfig, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
 	}
 
-	cfg := &AppConfig{
-		SitesFile:           *s,
-		ProxiesFile:         *p,
-		OutputDir:           *o,
-		Workers:             *w,
-		RequestTimeout:      *rt,
-		TotalTimeout:        *tt,
-		MaxIdleConns:        *mc,
-		MaxIdleConnsPerHost: *mch,
-		RateLimitPerHost:    *rl,
-		UserAgentFile:       *ua,
-		DeepSearch:          *d,
-		UseUTLS:             *utls,
-		MaxRetries:          *retries,
-	}
-
-	if *u != "" {
-		cfg.Targets = append(cfg.Targets, *u)
-	}
-	if *f != "" {
-		data, err := os.ReadFile(*f)
-		if err != nil {
-			return nil, fmt.Errorf("read targets file: %w", err)
+	result := make(map[string]models.SiteConfig)
+	for name, body := range raw {
+		if name == "$schema" {
+			continue
 		}
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") {
-				cfg.Targets = append(cfg.Targets, line)
+		var s sherlockSite
+		if err := json.Unmarshal(body, &s); err != nil {
+			continue // пропускаем битые записи
+		}
+		result[name] = s.toSiteConfig(name)
+	}
+	return result, nil
+}
+
+// parseMaigret парсит обёрнутый JSON Maigret.
+func parseMaigret(sitesRaw json.RawMessage) (map[string]models.SiteConfig, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(sitesRaw, &raw); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]models.SiteConfig)
+	for name, body := range raw {
+		var s maigretSite
+		if err := json.Unmarshal(body, &s); err != nil {
+			continue
+		}
+		result[name] = s.toSiteConfig(name)
+	}
+	return result, nil
+}
+
+func mergeInto(dst, src map[string]models.SiteConfig) {
+	for k, v := range src {
+		key := k
+		if existing, ok := dst[key]; ok {
+			if existing.URL == v.URL {
+				continue // полный дубликат
+			}
+			// Конфликт имени, но разные URL — формируем уникальный ключ и обновляем имя
+			suffix := sanitizeKey(v.URL)
+			key = fmt.Sprintf("%s_%s", k, suffix)
+			v.Name = fmt.Sprintf("%s (%s)", v.Name, suffix)
+		}
+		dst[key] = v
+	}
+}
+
+func sanitizeKey(url string) string {
+	replacer := strings.NewReplacer(
+		"https://", "", "http://", "", "/", "_", ".", "_",
+		"{", "", "}", "", "-", "_",
+	)
+	return strings.Trim(replacer.Replace(url), "_")
+}
+
+// --- Sherlock intermediate structure ---
+
+type sherlockSite struct {
+	ErrorType         string            `json:"errorType"`
+	ErrorMsg          json.RawMessage   `json:"errorMsg"` // string or []string
+	ErrorURL          string            `json:"errorUrl"`
+	RegexCheck        string            `json:"regexCheck"`
+	URL               string            `json:"url"`
+	URLMain           string            `json:"urlMain"`
+	URLProbe          string            `json:"urlProbe"`
+	UsernameClaimed   string            `json:"username_claimed"`
+	UsernameUnclaimed string            `json:"username_unclaimed"`
+	Headers           map[string]string `json:"headers"`
+	RequestHeadOnly   bool              `json:"request_head_only"`
+	IsNSFW            bool              `json:"isNSFW"`
+}
+
+func (s *sherlockSite) toSiteConfig(name string) models.SiteConfig {
+	cfg := models.SiteConfig{
+		Name:              name,
+		URL:               normalizeURL(s.URL),
+		URLProbe:          normalizeURL(s.URLProbe),
+		URLMain:           s.URLMain,
+		CheckType:         s.ErrorType,
+		ErrorURL:          s.ErrorURL,
+		RegexCheck:        s.RegexCheck,
+		Headers:           s.Headers,
+		RequestHeadOnly:   s.RequestHeadOnly,
+		UsernameClaimed:   s.UsernameClaimed,
+		UsernameUnclaimed: s.UsernameUnclaimed,
+		Weight:            10,
+	}
+	if s.IsNSFW {
+		cfg.Tags = append(cfg.Tags, "nsfw")
+	}
+
+	// errorMsg может быть строкой или массивом
+	var msgs []string
+	if len(s.ErrorMsg) > 0 {
+		if s.ErrorMsg[0] == '[' {
+			_ = json.Unmarshal(s.ErrorMsg, &msgs)
+		} else {
+			var single string
+			_ = json.Unmarshal(s.ErrorMsg, &single)
+			if single != "" {
+				msgs = append(msgs, single)
 			}
 		}
 	}
+	cfg.AbsenceStrs = msgs
 
-	for _, format := range strings.Split(*of, ",") {
-		format = strings.TrimSpace(strings.ToLower(format))
-		if format != "" {
-			cfg.OutputFormats = append(cfg.OutputFormats, format)
-		}
-	}
-	for _, format := range strings.Split(*rf, ",") {
-		format = strings.TrimSpace(strings.ToLower(format))
-		if format != "" {
-			cfg.ReportFormats = append(cfg.ReportFormats, format)
-		}
+	// Для status_code выставляем error_code если не задан
+	if cfg.CheckType == "status_code" && cfg.ErrorCode == 0 {
+		cfg.ErrorCode = 404
 	}
 
-	return cfg, nil
+	return cfg
+}
+
+// --- Maigret intermediate structure ---
+
+type maigretSite struct {
+	URL               string            `json:"url"`
+	URLMain           string            `json:"urlMain"`
+	URLProbe          string            `json:"urlProbe"`
+	CheckType         string            `json:"checkType"`
+	AbsenceStrs       []string          `json:"absenceStrs"`
+	PresenceStrs      []string          `json:"presenceStrs"`  // правильное написание
+	PresenseStrs      []string          `json:"presenseStrs"`  // опечатка в оригинале
+	Headers           map[string]string `json:"headers"`
+	Disabled          bool              `json:"disabled"`
+	UsernameClaimed   string            `json:"usernameClaimed"`
+	UsernameUnclaimed string            `json:"usernameUnclaimed"`
+	RegexCheck        string            `json:"regexCheck"`
+	Tags              []string          `json:"tags"`
+	AlexaRank         int               `json:"alexaRank"`
+	Engine            string            `json:"engine"`
+	RequestMethod     string            `json:"requestMethod"`
+	RequestPayload    json.RawMessage   `json:"requestPayload"` // map или string
+	Errors            map[string]string `json:"errors"`
+	Protection        []string          `json:"protection"`
+	Source            string            `json:"source"`
+}
+
+func (m *maigretSite) toSiteConfig(name string) models.SiteConfig {
+	cfg := models.SiteConfig{
+		Name:              name,
+		URL:               normalizeURL(m.URL),
+		URLProbe:          normalizeURL(m.URLProbe),
+		URLMain:           m.URLMain,
+		CheckType:         m.CheckType,
+		AbsenceStrs:       m.AbsenceStrs,
+		PresenceStrs:      mergeSlices(m.PresenceStrs, m.PresenseStrs),
+		Headers:           m.Headers,
+		Disabled:          m.Disabled,
+		RegexCheck:        m.RegexCheck,
+		Tags:              m.Tags,
+		AlexaRank:         m.AlexaRank,
+		Engine:            m.Engine,
+		RequestMethod:     m.RequestMethod,
+		Protection:        m.Protection,
+		Source:            m.Source,
+		UsernameClaimed:   m.UsernameClaimed,
+		UsernameUnclaimed: m.UsernameUnclaimed,
+		Weight:            10,
+	}
+
+	// requestPayload может быть объектом или строкой
+	if len(m.RequestPayload) > 0 {
+		if m.RequestPayload[0] == '{' || m.RequestPayload[0] == '[' {
+			cfg.RequestPayload = string(m.RequestPayload)
+		} else {
+			var s string
+			_ = json.Unmarshal(m.RequestPayload, &s)
+			cfg.RequestPayload = s
+		}
+	}
+
+	// Миграция checkType
+	if cfg.CheckType == "" {
+		switch {
+		case cfg.ErrorCode != 0:
+			cfg.CheckType = "status_code"
+		case len(cfg.AbsenceStrs) > 0:
+			cfg.CheckType = "message"
+		case cfg.ErrorURL != "":
+			cfg.CheckType = "response_url"
+		}
+	}
+
+	return cfg
+}
+
+func normalizeURL(u string) string {
+	if u == "" {
+		return ""
+	}
+	// Sherlock использует {} вместо {username}
+	u = strings.ReplaceAll(u, "{}", "{username}")
+	// Maigret использует {urlMain} и {urlSubpath} — заменяем на пустое / заглушку
+	u = strings.ReplaceAll(u, "{urlMain}", "")
+	u = strings.ReplaceAll(u, "{urlSubpath}", "")
+	return u
+}
+
+func mergeSlices(a, b []string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, s := range a {
+		if _, ok := seen[s]; !ok && s != "" {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	for _, s := range b {
+		if _, ok := seen[s]; !ok && s != "" {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
 }
